@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ELISA 4PL - Patient Popup</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans JP", "Hiragino Sans", "Meiryo", sans-serif; margin: 16px; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:12px; }
+    #plot { width: 980px; max-width: 100%; height: 620px; }
+    label { font-weight: 600; }
+    input[type="file"]{ margin-top: 6px; }
+    .hint { color:#555; font-size: 0.95em; margin-top: 6px; }
+    table { border-collapse: collapse; width:100%; font-size: 0.95em; }
+    th, td { border:1px solid #e5e5e5; padding: 6px 8px; text-align:left; vertical-align:top; }
+    th { background:#fafafa; }
+    .muted { color:#666; }
+  </style>
+  <!-- Plotly -->
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+</head>
+<body>
+  <h2>ELISA 検量線（4PL）と患者情報のポップアップ</h2>
+
+  <div class="row">
+    <div class="card" style="flex:1 1 320px; max-width: 420px;">
+      <label>CSV（260615elisa_results.csv）を読み込み</label>
+      <input id="fileInput" type="file" accept=".csv" />
+      <div class="hint">
+        CSV列名（例）: <span class="muted">Sample ID / Absorbance (OD) / Calculated Conc. / age / 性別 / procedure</span><br/>
+        ※ Calculated Conc. が「範囲外 (Out of Range)」の場合は点表示だけ行い、濃度は空欄扱いにします。
+      </div>
+
+      <hr style="margin:12px 0; border:none; border-top:1px solid #eee;" />
+
+      <div class="hint">
+        クリックまたはホバーでポイントに患者情報が表示されます。
+      </div>
+    </div>
+
+    <div class="card" style="flex: 2 1 640px;">
+      <div id="plot"></div>
+    </div>
+  </div>
+
+  <script>
+    // ---- 4PL curve (from your previous fit) ----
+    // 注意: ここは「あなたの最終的な popt_final（A,B,C,D）」を入れてください。
+    // もしこのHTMLだけで完全に一致させたい場合は、Python側で popt_final を出力して値をこの4つに差し替えます。
+    const FOUR_PL = {
+      A: 0.2028888917667933,        // min asymptote
+      B: 21.256369664571807,        // Hill slope
+      C: 26.349897893195426,        // EC50
+      D: 0.6600000225238474         // max asymptote
+    };
+
+    function fourPL(x, A, B, C, D){
+      return D + (A - D) / (1 + Math.pow(x / C, B));
+    }
+
+    function isNumberLike(v){
+      if (v === null || v === undefined) return false;
+      if (typeof v === 'number' && Number.isFinite(v)) return true;
+      if (typeof v === 'string'){
+        const t = v.trim();
+        if (t === '') return false;
+        if (t.includes('範囲外') || t.includes('Out of Range')) return false;
+        const n = Number(t);
+        return Number.isFinite(n);
+      }
+      return false;
+    }
+
+    function parseCSV(text){
+      // シンプルCSVパーサ（カンマ区切り、ダブルクォート対応を軽く実装）
+      // 注意: スペースや改行はそのまま扱います。日本語カラム名でもOKです。
+      const rows = [];
+      let cur = '';
+      let inQuotes = false;
+      const line = (arr) => arr.map(s => s.trim().replace(/^"|"$/g,'')); // 外側クォート除去
+      for (let i=0;i<text.length;i++){
+        const ch = text[i];
+        if (ch === '"'){
+          // 連続する "" を "" として扱う
+          if (inQuotes && text[i+1] === '"'){ cur += '"'; i++; continue; }
+          inQuotes = !inQuotes;
+        }else if (ch === ',' && !inQuotes){
+          // セル終わり
+          // ここでは行区切りが無いので一旦セルへ積む処理を行末で行う
+          cur += '\u0000'; // セル区切り
+        }else if ((ch === '\n' || ch === '\r') && !inQuotes){
+          // 行末（CRLF対応）
+          if (ch === '\r' && text[i+1] === '\n') i++;
+          rows.push(cur);
+          cur = '';
+        }else{
+          cur += ch;
+        }
+      }
+      if (cur.trim() !== '') rows.push(cur);
+
+      // 先頭行ヘッダ
+      const splitRow = (r) => {
+        const cells = r.split('\u0000').map(s => s.replace(/\uFEFF/g,'').trim());
+        // 空行を除外
+        return cells;
+      };
+
+      const header = splitRow(rows[0]).map(h => h.trim().replace(/\uFEFF/g,''));
+      const data = rows.slice(1).filter(r => r.trim() !== '').map(r => {
+        const cells = splitRow(r);
+        const obj = {};
+        for (let i=0;i<header.length;i++){
+          obj[header[i]] = (cells[i] ?? '').trim();
+        }
+        return obj;
+      });
+      return { header, data };
+    }
+
+    function buildPlot(combinedData){
+      // dataキー
+      const has = (k) => combinedData.some(r => Object.prototype.hasOwnProperty.call(r, k));
+
+      const sampleKey = has('Sample ID') ? 'Sample ID' : (has('sample') ? 'sample' : null);
+      const odKey = has('Absorbance (OD)') ? 'Absorbance (OD)' : (has('OD') ? 'OD' : null);
+      const concKey = has('Calculated Conc.') ? 'Calculated Conc.' : (has('Conc') ? 'Conc' : null);
+      const ageKey = has('age') ? 'age' : (has('Age') ? 'Age' : null);
+      const sexKey = has('性別') ? '性別' : (has('sex') ? 'sex' : null);
+      const procKey = has('procedure') ? 'procedure' : null;
+
+      if (!sampleKey || !odKey){
+        alert('CSVの列名が見つかりません。最低でも Sample ID, Absorbance (OD) が必要です。');
+        return;
+      }
+
+      // 曲線生成用Xレンジ（あなたの標準液に合わせて）
+      const xMin = 0.1;
+      const xMax = 120;
+      const xVals = [];
+      const yVals = [];
+      for(let i=0;i<400;i++){
+        const t = i/(399);
+        // logspace
+        const x = Math.pow(10, Math.log10(xMin) + t*(Math.log10(xMax)-Math.log10(xMin)));
+        xVals.push(x);
+        if (FOUR_PL.A !== null){
+          yVals.push(fourPL(x, FOUR_PL.A, FOUR_PL.B, FOUR_PL.C, FOUR_PL.D));
+        }else{
+          yVals.push(null);
+        }
+      }
+
+      // サンプル点
+      const xs = [];
+      const ys = [];
+      const texts = [];
+      const hoverDetails = [];
+      const concs = [];
+
+      combinedData.forEach(r => {
+        const sid = r[sampleKey];
+        const y = Number(r[odKey]);
+        if (!Number.isFinite(y)) return;
+
+        xs.push(Number(sid)); // xにSample IDを使うのはNG。ここは「濃度軸に載せる」方針にする。
+        // ただ、あなたのCSVには濃度もCalculated Conc.があるので、それを使います。
+      });
+
+      // グループごとにデータを分類（性別 × procedure）
+      const colorMap = {
+        'F:fai': { color: '#e74c3c', name: 'Female - FAI' },      // 赤
+        'F:tha': { color: '#f39c12', name: 'Female - THA' },      // オレンジ
+        'F:shelf': { color: '#e91e63', name: 'Female - Shelf' },  // ピンク
+        'M:fai': { color: '#3498db', name: 'Male - FAI' },        // 青
+        'M:tha': { color: '#2ecc71', name: 'Male - THA' },        // 緑
+        'M:shelf': { color: '#9c27b0', name: 'Male - Shelf' }     // 紫
+      };
+
+      const groupData = {};
+      for (const key of Object.keys(colorMap)) {
+        groupData[key] = { xs: [], ys: [], texts: [] };
+      }
+
+      combinedData.forEach(r => {
+        const sid = r[sampleKey];
+        const od = Number(r[odKey]);
+        if (!Number.isFinite(od)) return;
+
+        let conc = NaN;
+        if (concKey && isNumberLike(r[concKey])){
+          conc = Number(r[concKey]);
+        }
+
+        const age = ageKey ? r[ageKey] : '';
+        const sex = sexKey ? r[sexKey] : '';
+        const proc = procKey ? r[procKey] : '';
+
+        const rangeFlag = (r[concKey] || '').toString().includes('範囲外') || (r[concKey] || '').toString().includes('Out of Range');
+
+        const hoverText =
+          `Sample ID: ${sid}<br>` +
+          `Absorbance (OD): ${od}<br>` +
+          `Calculated Conc.: ${r[concKey] || ''}${rangeFlag ? '（範囲外）' : ''}<br>` +
+          `Age: ${age}<br>` +
+          `Sex: ${sex}<br>` +
+          `Procedure: ${proc}`;
+
+        // グループキーの決定（性別:procedure）
+        const groupKey = `${sex}:${proc}`;
+
+        // 有効な濃度だけを追加
+        if (Number.isFinite(conc) && conc > 0) {
+          if (groupData[groupKey]) {
+            groupData[groupKey].xs.push(conc);
+            groupData[groupKey].ys.push(od);
+            groupData[groupKey].texts.push(hoverText);
+          }
+        }
+      });
+
+      // トレースの配列を作成
+      const traces = [];
+
+      // 検量線
+      const curveTrace = {
+        x: xVals,
+        y: yVals,
+        mode: 'lines',
+        name: '4PL Fit Curve',
+        line: { color: '#34495e', width: 3 },
+        hoverinfo: 'skip'
+      };
+      traces.push(curveTrace);
+
+      // グループごとにトレースを追加
+      for (const [key, config] of Object.entries(colorMap)) {
+        if (groupData[key].xs.length > 0) {
+          const trace = {
+            x: groupData[key].xs,
+            y: groupData[key].ys,
+            mode: 'markers',
+            name: config.name,
+            marker: { size: 10, color: config.color, opacity: 0.85 },
+            text: groupData[key].texts,
+            hovertemplate: '%{text}<extra></extra>'
+          };
+          traces.push(trace);
+        }
+      }
+
+      const layout = {
+        title: 'ELISA 4PL + Patient Info',
+        xaxis: {
+          title: 'Concentration',
+          type: 'log',
+          autorange: true
+        },
+        yaxis: { title: 'Absorbance (OD)' },
+        legend: { orientation: 'v', x: 1.02, y: 1 },
+        margin: { l: 70, r: 150, t: 55, b: 60 },
+        hovermode: 'closest'
+      };
+
+      Plotly.newPlot('plot', traces, layout, { responsive: true });
+    }
+
+    document.getElementById('fileInput').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const text = await file.text();
+      const parsed = parseCSV(text);
+      buildPlot(parsed.data);
+    });
+
+    // ページロード時に自動読み込みを試みる
+    // 注: ブラウザセキュリティの制限により、file:// では fetch が使えないため、
+    // サーバー経由でホストするか、ファイル入力で手動選択してください
+  </script>
+
+  <div class="hint" style="margin-top:12px;">
+    <b>お願い:</b> このHTMLは「曲線パラメータ（4PLのA,B,C,D）」が未設定です。正しい検量線とピッタリ一致させるには、Pythonで出た最終の A,B,C,D をこのHTMLの <span class="muted">FOUR_PL</span> に入れてください。
+  </div>
+</body>
+</html>

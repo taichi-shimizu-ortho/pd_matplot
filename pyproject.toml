@@ -1,0 +1,13 @@
+[project]
+name = "pd-matplot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "matplotlib>=3.10.8",
+    "pandas>=3.0.1",
+    "pymupdf4llm>=0.3.4",
+    "scipy>=1.17.1",
+]
